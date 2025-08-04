@@ -10,7 +10,6 @@ import io.airbyte.cdk.command.OpaqueStateValue
 import io.airbyte.cdk.output.DataChannelMedium.SOCKET
 import io.airbyte.cdk.output.DataChannelMedium.STDIO
 import io.airbyte.cdk.output.OutputMessageRouter
-import io.airbyte.cdk.output.sockets.NativeRecordPayload
 import io.airbyte.cdk.read.GlobalFeedBootstrap
 import io.airbyte.cdk.read.PartitionReadCheckpoint
 import io.airbyte.cdk.read.PartitionReader
@@ -27,12 +26,15 @@ import io.debezium.engine.ChangeEvent
 import io.debezium.engine.DebeziumEngine
 import io.debezium.engine.format.Json
 import io.github.oshai.kotlinlogging.KotlinLogging
+import java.time.Duration
+import java.time.LocalDateTime
 import java.util.*
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import java.util.function.Consumer
-import kotlin.coroutines.CoroutineContext
-import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
@@ -70,7 +72,11 @@ class CdcPartitionReader<T : Comparable<T>>(
     internal val numEventValuesWithoutPosition = AtomicLong()
 
     protected var partitionId: String = generatePartitionId(4)
-    private lateinit var acceptors: Map<StreamIdentifier, (NativeRecordPayload) -> Unit>
+
+    // Queue for event polling with timeout support
+    private val eventQueue = LinkedBlockingQueue<ChangeEvent<String?, String?>>(10000)
+    private val receivedFirstRecord = AtomicBoolean(false)
+    private var maxNoRecordsAttempts = 0
     interface AcquiredResource : AutoCloseable {
         val resource: Resource.Acquired?
     }
@@ -147,7 +153,9 @@ class CdcPartitionReader<T : Comparable<T>>(
                 .using(decoratedProperties)
                 .using(ConnectorCallback())
                 .using(CompletionCallback())
-                .notifying(EventConsumer(coroutineContext))
+                .notifying { event ->
+                    eventQueue.offer(event)
+                } // Put events in queue instead of direct processing
                 .build()
         val debeziumVersion: String = DebeziumEngine::class.java.getPackage().implementationVersion
         log.info { "Running Debezium engine version $debeziumVersion." }
@@ -155,10 +163,15 @@ class CdcPartitionReader<T : Comparable<T>>(
         val thread = Thread(engine, "debezium-engine")
         thread.setUncaughtExceptionHandler { _, e: Throwable -> engineException.set(e) }
         thread.start()
+
+        // Create event consumer for processing queue
+        val eventConsumer = EventConsumer()
+
+        // Process events from queue with timeout
         try {
-            withContext(Dispatchers.IO) { thread.join() }
+            withContext(Dispatchers.IO) { processEventQueue(eventConsumer, thread) }
         } catch (e: Throwable) {
-            // This catches any exceptions thrown by join()
+            // This catches any exceptions thrown by processEventQueue()
             // but also by the kotlin coroutine dispatcher, like TimeoutCancellationException.
             engineException.compareAndSet(null, e)
         }
@@ -202,9 +215,79 @@ class CdcPartitionReader<T : Comparable<T>>(
         )
     }
 
-    inner class EventConsumer(
-        private val coroutineContext: CoroutineContext,
-    ) : Consumer<ChangeEvent<String?, String?>> {
+    private fun processEventQueue(eventConsumer: EventConsumer, engineThread: Thread) {
+        // Get timeout configuration from properties
+        val firstRecordWaitTimeSeconds =
+            debeziumProperties["airbyte.first.record.wait.seconds"]?.toLongOrNull() ?: 300L
+        val subsequentRecordWaitTimeSeconds = firstRecordWaitTimeSeconds / 2
+
+        while (engineThread.isAlive || !eventQueue.isEmpty()) {
+            val waitTimeSeconds =
+                if (receivedFirstRecord.get()) subsequentRecordWaitTimeSeconds
+                else firstRecordWaitTimeSeconds
+
+            val event =
+                try {
+                    eventQueue.poll(waitTimeSeconds, TimeUnit.SECONDS)
+                } catch (e: InterruptedException) {
+                    throw RuntimeException("Interrupted while polling for events", e)
+                }
+
+            if (event == null) {
+                // No event received within timeout
+                log.info { "No CDC events received within $waitTimeSeconds seconds timeout" }
+
+                // Check if we should close the engine
+                if (!receivedFirstRecord.get() || maxNoRecordsAttempts >= 10) {
+                    val reason =
+                        "Closing Debezium engine after no records received within $waitTimeSeconds seconds. " +
+                            "FirstRecord=${receivedFirstRecord.get()}, attempts=$maxNoRecordsAttempts"
+                    log.info { reason }
+
+                    if (closeReasonReference.compareAndSet(null, CloseReason.NO_EVENTS_TIMEOUT)) {
+                        runBlocking { launch(Dispatchers.IO + Job()) { engine.close() } }
+                    }
+                    // Wait for engine to shut down
+                    engineThread.join()
+                    break
+                }
+
+                maxNoRecordsAttempts++
+                log.info { "Waiting for more records, attempt $maxNoRecordsAttempts" }
+                continue
+            }
+
+            // Reset attempts counter when we receive an event
+            maxNoRecordsAttempts = 0
+            if (!receivedFirstRecord.get()) {
+                receivedFirstRecord.set(true)
+                log.info { "Received first CDC event" }
+            }
+
+            // Process the event
+            eventConsumer.accept(event)
+
+            // Check if engine should be closed
+            if (closeReasonReference.get() != null) {
+                // Engine close was triggered, wait for it to shut down
+                engineThread.join()
+                break
+            }
+        }
+    }
+
+    inner class EventConsumer() : Consumer<ChangeEvent<String?, String?>> {
+
+        // Heartbeat timeout tracking fields (configurable per connector)
+        private var lastHeartbeatPosition: T? = null
+        private var lastHeartbeatTime: LocalDateTime? = null
+        // Only enable heartbeat timeout if explicitly configured
+        private val heartbeatTimeoutDuration: Duration? =
+            debeziumProperties["airbyte.heartbeat.timeout.seconds"]?.let {
+                Duration.ofSeconds(it.toLongOrNull() ?: 0L).takeIf { duration ->
+                    duration.seconds > 0
+                }
+            }
 
         override fun accept(changeEvent: ChangeEvent<String?, String?>) {
             val event = DebeziumEvent(changeEvent)
@@ -302,6 +385,43 @@ class CdcPartitionReader<T : Comparable<T>>(
             }
 
             val currentPosition: T? = position(event.sourceRecord) ?: position(event.value)
+
+            // Only check for heartbeat timeout if it's configured AND this is a heartbeat event
+            if (eventType == EventType.HEARTBEAT && heartbeatTimeoutDuration != null) {
+                val heartbeatPosition = currentPosition
+                val now = LocalDateTime.now()
+
+                // Check if heartbeat position is progressing
+                val isProgressing = heartbeatPosition != lastHeartbeatPosition
+                if (isProgressing) {
+                    // Position is advancing - update tracking variables
+                    lastHeartbeatPosition = heartbeatPosition
+                    lastHeartbeatTime = now
+                    log.info { "Heartbeat progressing to position: $heartbeatPosition" }
+                } else {
+                    // Position is not advancing - check timeout
+                    val lastTime = lastHeartbeatTime
+                    if (lastTime != null) {
+                        val timeSinceLastProgress = Duration.between(lastTime, now)
+                        if (timeSinceLastProgress > heartbeatTimeoutDuration) {
+                            log.info {
+                                "Heartbeat timeout: no progress for ${timeSinceLastProgress.toMinutes()} minutes. " +
+                                    "Last position: $lastHeartbeatPosition, current: $heartbeatPosition"
+                            }
+                            return CloseReason.HEARTBEAT_NOT_PROGRESSING
+                        }
+                        log.info {
+                            "Heartbeat not progressing, time since last progress: ${timeSinceLastProgress.toSeconds()}s"
+                        }
+                    } else {
+                        // First heartbeat with this position - start tracking
+                        lastHeartbeatTime = now
+                        lastHeartbeatPosition = heartbeatPosition
+                    }
+                }
+            }
+
+            // Original logic: close if current position >= upper bound
             if (currentPosition == null || currentPosition < upperBound) {
                 return null
             }
@@ -387,5 +507,9 @@ class CdcPartitionReader<T : Comparable<T>>(
         RECORD_REACHED_TARGET_POSITION(
             "record indicates that WAL consumption has reached the target position"
         ),
+        HEARTBEAT_NOT_PROGRESSING(
+            "heartbeat position has not progressed for an extended period, indicating database is idle"
+        ),
+        NO_EVENTS_TIMEOUT("no events received from Debezium within configured timeout period"),
     }
 }
