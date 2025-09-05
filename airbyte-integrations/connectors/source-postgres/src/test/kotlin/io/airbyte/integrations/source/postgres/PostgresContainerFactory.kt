@@ -3,6 +3,7 @@ package io.airbyte.integrations.source.postgres
 import io.airbyte.cdk.testcontainers.TestContainerFactory
 import io.airbyte.integrations.source.postgres.config.PostgresSourceConfigurationSpecification
 import io.airbyte.integrations.source.postgres.config.UserDefinedCursorConfigurationSpecification
+import io.airbyte.protocol.models.v0.ConfiguredAirbyteCatalog
 import io.github.oshai.kotlinlogging.KotlinLogging
 import java.io.IOException
 import java.io.UncheckedIOException
@@ -12,11 +13,11 @@ import org.testcontainers.utility.DockerImageName
 import org.testcontainers.utility.MountableFile
 
 object PostgresContainerFactory {
-    const val COMPATIBLE_NAME = "postgres:17-bullseye"
+    private const val POSTGRES_17_BULLSEYE = "postgres:17-bullseye"
     private val log = KotlinLogging.logger {}
 
     init {
-        TestContainerFactory.register(COMPATIBLE_NAME, ::PostgreSQLContainer )
+        TestContainerFactory.register(POSTGRES_17_BULLSEYE, ::PostgreSQLContainer )
     }
 
     sealed interface PostgresContainerModifier :
@@ -125,17 +126,17 @@ object PostgresContainerFactory {
         }
     }
 
-    fun shared(
-        imageName: String,
-        vararg modifiers: PostgresContainerModifier,
-    ): PostgreSQLContainer<*> {
+    fun shared17(): PostgreSQLContainer<*> {
         val dockerImageName =
-            DockerImageName.parse(imageName).asCompatibleSubstituteFor(COMPATIBLE_NAME)
-        return TestContainerFactory.shared(dockerImageName, *modifiers)
+            DockerImageName.parse(POSTGRES_17_BULLSEYE)
+        return TestContainerFactory.shared(dockerImageName)
     }
 
     @JvmStatic
-    fun config(postgresContainer: PostgreSQLContainer<*>) : PostgresSourceConfigurationSpecification =
+    fun config(
+        postgresContainer: PostgreSQLContainer<*>,
+        schemas: List<String> = listOf("public"),
+    ) : PostgresSourceConfigurationSpecification =
         PostgresSourceConfigurationSpecification().apply {
             host = postgresContainer.host
             port = postgresContainer.getMappedPort(PostgreSQLContainer.POSTGRESQL_PORT)
@@ -143,7 +144,7 @@ object PostgresContainerFactory {
             password = postgresContainer.password
             jdbcUrlParams = ""
             database = "test"
-            schemas = listOf("public")
+            this.schemas = schemas
             checkpointTargetIntervalSeconds = 60
             max_db_connections = 1
             setIncrementalConfigurationSpecificationValue(

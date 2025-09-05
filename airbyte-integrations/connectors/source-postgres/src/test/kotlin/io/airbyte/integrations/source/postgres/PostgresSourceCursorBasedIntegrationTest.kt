@@ -4,7 +4,6 @@ import io.airbyte.cdk.StreamIdentifier
 import io.airbyte.cdk.command.CliRunner
 import io.airbyte.cdk.discover.DiscoveredStream
 import io.airbyte.cdk.discover.EmittedField
-import io.airbyte.cdk.discover.Field
 import io.airbyte.cdk.jdbc.IntFieldType
 import io.airbyte.cdk.jdbc.JdbcConnectionFactory
 import io.airbyte.cdk.jdbc.StringFieldType
@@ -64,8 +63,7 @@ class PostgresSourceCursorBasedIntegrationTest {
 
     companion object {
         val log = KotlinLogging.logger {}
-        val dbContainer: PostgreSQLContainer<*> =
-            PostgresContainerFactory.shared(imageName = "postgres:17-bullseye")
+        val dbContainer: PostgreSQLContainer<*> = PostgresContainerFactory.shared17()
 
         val config: PostgresSourceConfigurationSpecification =
             PostgresContainerFactory.config(dbContainer)
