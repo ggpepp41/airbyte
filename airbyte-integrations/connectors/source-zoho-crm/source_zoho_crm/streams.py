@@ -66,6 +66,26 @@ class ZohoCrmStream(HttpStream, ABC):
             self.logger.warning(f"Unknown data type in module {self.module.api_name}, skipping. Details: {exc}")
             raise
 
+class SubformZohoCrmStream(ZohoCrmStream):
+    url_base: str = None
+
+    def __init__(self, authenticator, config, module, subform_field, url_base):
+        super().__init__(authenticator)
+        self._config = config
+        self.module = module
+        self.subform_field = subform_field
+        self.url_base = url_base
+
+    def path(self, *args, **kwargs) -> str:
+        # Adjust path as needed for subform API endpoint
+        return f"/crm/v2/{self.module.api_name}"
+
+    def parse_response(self, response: requests.Response, **kwargs) -> Iterable[Mapping]:
+        data = [] if response.status_code in EMPTY_BODY_STATUSES else response.json()["data"]
+        for record in data:
+            subform_records = record.get(self.subform_field.api_name, [])
+            for subform_record in subform_records:
+                yield subform_record
 
 class IncrementalZohoCrmStream(ZohoCrmStream):
     cursor_field = "Modified_Time"
@@ -119,10 +139,13 @@ class ZohoStreamFactory:
         fields_meta_json = self.api.fields_settings(module.api_name)
         fields_meta = []
         for field in fields_meta_json:
-            pick_list_values = field.get("pick_list_values", [])
-            if pick_list_values:
-                field["pick_list_values"] = [ZohoPickListItem.from_dict(pick_list_item) for pick_list_item in field["pick_list_values"]]
-            fields_meta.append(FieldMeta.from_dict(field))
+            if field.get("json_type") != "jsonarray" and field.get("data_type") != "multiselectlookup":   
+                pick_list_values = field.get("pick_list_values", [])
+                if pick_list_values:
+                    field["pick_list_values"] = [ZohoPickListItem.from_dict(pick_list_item) for pick_list_item in field["pick_list_values"]]
+                fields_meta.append(FieldMeta.from_dict(field))
+            else:
+                print("Skipping field:", field.get("api_name"))
         module.fields = fields_meta
 
     def _populate_module_meta(self, module: ModuleMeta):
@@ -132,6 +155,7 @@ class ZohoStreamFactory:
     def produce(self) -> List[HttpStream]:
         modules = self._init_modules_meta()
         streams = []
+        subform_streams = []
 
         def populate_module(module):
             self._populate_module_meta(module)
@@ -154,4 +178,20 @@ class ZohoStreamFactory:
             stream = incremental_stream_cls(self.api.authenticator, config=self._config)
             if stream.get_json_schema():
                 streams.append(stream)
+
+            # NEW: Detect subform fields of type jsonarray and create subform streams
+            for field in getattr(module, "fields", []):
+                if getattr(field, "json_type", None) == "jsonarray":
+                    subform_stream = SubformZohoCrmStream(
+                        self.api.authenticator,
+                        config=self._config,
+                        module=module,
+                        subform_field=field,
+                        url_base=self.api.api_url,  # Pass the API URL here
+                    )
+                    if subform_stream.get_json_schema():
+                        subform_streams.append(subform_stream)
+
+        # NEW: Add subform streams to the main streams list
+        streams.extend(subform_streams)
         return streams
